@@ -4820,3 +4820,100 @@ func selfSignedCertificate() (*x509.Certificate, *ecdsa.PrivateKey, error) {
 	}
 	return cert, priv, nil
 }
+
+func TestAttestationDownloadMixedBundleFormats(t *testing.T) {
+	// Test for issue https://github.com/sigstore/cosign/issues/4573
+	// When both new-bundle-format (referrers API) and old-style (annotations)
+	// attestations exist, download should return both, not just the new-bundle-format ones.
+	repo, stop := reg(t)
+	defer stop()
+	td := t.TempDir()
+
+	imgName := path.Join(repo, "cosign-mixed-attestation-download-e2e")
+
+	_, _, cleanup := mkimage(t, imgName)
+	defer cleanup()
+
+	_, privKeyPath, _ := keypair(t, td)
+
+	ctx := context.Background()
+
+	slsaAttestation := `{ "buildType": "x", "builder": { "id": "2" }, "recipe": {} }`
+	slsaAttestationPath := filepath.Join(td, "attestation.slsa.json")
+	if err := os.WriteFile(slsaAttestationPath, []byte(slsaAttestation), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	vulnAttestation := `
+	{
+    "invocation": {
+      "parameters": null,
+      "uri": "invocation.example.com/cosign-testing",
+      "event_id": "",
+      "builder.id": ""
+    },
+    "scanner": {
+      "uri": "fakescanner.example.com/cosign-testing",
+      "version": "",
+      "db": {
+        "uri": "",
+        "version": ""
+      },
+      "result": null
+    },
+    "metadata": {
+      "scanStartedOn": "2022-04-12T00:00:00Z",
+      "scanFinishedOn": "2022-04-12T00:10:00Z"
+    }
+}
+`
+	vulnAttestationPath := filepath.Join(td, "attestation.vuln.json")
+	if err := os.WriteFile(vulnAttestationPath, []byte(vulnAttestation), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// First, create attestations with new bundle format (will use referrers API)
+	koNew := options.KeyOpts{KeyRef: privKeyPath, PassFunc: passFunc, NewBundleFormat: true}
+
+	attestCommandNew := attest.AttestCommand{
+		KeyOpts:        koNew,
+		PredicatePath:  slsaAttestationPath,
+		PredicateType:  "slsaprovenance",
+		Timeout:        30 * time.Second,
+		Replace:        false,
+		RekorEntryType: "dsse",
+	}
+	must(attestCommandNew.Exec(ctx, imgName), t)
+
+	// Then, create attestations with old bundle format (will use annotations)
+	koOld := options.KeyOpts{KeyRef: privKeyPath, PassFunc: passFunc, NewBundleFormat: false}
+
+	attestCommandOld := attest.AttestCommand{
+		KeyOpts:        koOld,
+		PredicatePath:  vulnAttestationPath,
+		PredicateType:  "vuln",
+		Timeout:        30 * time.Second,
+		Replace:        false,
+		RekorEntryType: "dsse",
+	}
+	must(attestCommandOld.Exec(ctx, imgName), t)
+
+	// Download all attestations - should get both new and old style
+	regOpts := options.RegistryOptions{}
+	attOpts := options.AttestationDownloadOptions{}
+	var out bytes.Buffer
+	must(download.AttestationCmd(ctx, regOpts, attOpts, imgName, &out), t)
+
+	// Parse the output to count attestations
+	attestationCount := 0
+	for _, line := range bytes.Split(out.Bytes(), []byte("\n")) {
+		if len(bytes.TrimSpace(line)) > 0 {
+			attestationCount++
+		}
+	}
+
+	// We should have 2 attestations (1 new-bundle-format + 1 old-style)
+	if attestationCount != 2 {
+		t.Fatalf("expected 2 attestations (mixed formats), got %d", attestationCount)
+	}
+}
